@@ -184,8 +184,10 @@ async def handle_webhook(request: web.Request) -> web.Response:
         return web.Response(status=400, text="Bad Request")
 
     try:
-        update = Update.model_validate(data, context={"bot": bot})
-        await dp.feed_update(update)
+        # Парсим апдейт
+        update = Update.model_validate(data)
+        # ВАЖНО: передаём и bot, и update
+        await dp.feed_update(bot, update)
     except Exception as e:
         logging.exception("Ошибка при обработке апдейта: %s", e)
         # В любом случае отвечаем 200, чтобы Telegram не отключал webhook
