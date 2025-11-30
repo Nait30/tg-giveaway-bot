@@ -20,8 +20,8 @@ PORT = int(os.getenv("PORT", "10000"))
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN не задан в переменных окружения")
 
-# Telegram будет слать запросы ровно на этот путь
-WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
+# ВАЖНО: теперь путь вебхука фиксированный, без токена
+WEBHOOK_PATH = "/webhook"
 
 # === Глобальные объекты бота / диспетчера / БД ===
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -29,7 +29,7 @@ dp = Dispatcher()
 router = Router()
 dp.include_router(router)
 
-db = None  # сюда положим соединение с SQLite
+db = None  # соединение с SQLite
 
 
 # === Работа с БД ===
@@ -180,7 +180,7 @@ async def handle_webhook(request: web.Request) -> web.Response:
         data = await request.json()
     except Exception as e:
         logging.exception("Не удалось распарсить JSON от Telegram: %s", e)
-        # Только в этом случае реально возвращаем 400
+        # При кривом JSON реально возвращаем 400
         return web.Response(status=400, text="Bad Request")
 
     try:
@@ -188,20 +188,19 @@ async def handle_webhook(request: web.Request) -> web.Response:
         await dp.feed_update(update)
     except Exception as e:
         logging.exception("Ошибка при обработке апдейта: %s", e)
-        # В любом случае отвечаем 200, чтобы Телеграм не отключал webhook
+        # В любом случае отвечаем 200, чтобы Telegram не отключал webhook
         return web.Response(text="ok")
 
     return web.Response(text="ok")
 
 
-# === Создание и запуск aiohttp-приложения ===
 def create_app() -> web.Application:
     app = web.Application()
 
-    # Маршрут для Telegram webhook
+    # маршрут для Telegram webhook: ЧЁТКО /webhook
     app.router.add_post(WEBHOOK_PATH, handle_webhook)
 
-    # Простой healthcheck на /
+    # healthcheck на /
     async def healthcheck(request: web.Request) -> web.Response:
         return web.json_response({"status": "ok"})
 
