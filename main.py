@@ -8,19 +8,22 @@ from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, Update
 
-import aiosqlite
+import asyncpg
 
 # === Конфиг из переменных окружения ===
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "MM_studio_spb")  # без @
 ADMIN_USERNAMES = os.getenv("ADMIN_USERNAMES", "M_M_nails,N_a_i_t")
-DB_PATH = os.getenv("DB_PATH", "participants.db")
+DATABASE_URL = os.getenv("DATABASE_URL")
 PORT = int(os.getenv("PORT", "10000"))
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN не задан в переменных окружения")
 
-# ВАЖНО: теперь путь вебхука фиксированный, без токена
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL не задан в переменных окружения")
+
+# ВАЖНО: путь вебхука фиксированный, без токена
 WEBHOOK_PATH = "/webhook"
 
 # === Глобальные объекты бота / диспетчера / БД ===
@@ -29,56 +32,73 @@ dp = Dispatcher()
 router = Router()
 dp.include_router(router)
 
-db = None  # соединение с SQLite
+db_pool: asyncpg.Pool | None = None  # пул соединений с Postgres
 
 
 # === Работа с БД ===
 async def init_db():
-    global db
-    db = await aiosqlite.connect(DB_PATH)
-    await db.execute(
-        """
-        CREATE TABLE IF NOT EXISTS participants (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER UNIQUE,
-            username TEXT,
-            first_name TEXT,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    """
+    Подключаемся к Postgres и создаём таблицу participants, если её ещё нет.
+    """
+    global db_pool
+    logging.info("Подключаемся к Postgres...")
+    db_pool = await asyncpg.create_pool(DATABASE_URL)
+
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS participants (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT UNIQUE NOT NULL,
+                username TEXT,
+                first_name TEXT,
+                created_at TIMESTAMPTZ DEFAULT now()
+            );
+            """
         )
-        """
-    )
-    await db.commit()
-    logging.info("База participants готова")
+    logging.info("Таблица participants готова")
 
 
-async def get_or_create_participant(user_id, username, first_name):
-    """Вернёт существующий номер или создаст новый."""
-    global db
-    cur = await db.execute(
-        "SELECT id FROM participants WHERE user_id = ?", (user_id,)
-    )
-    row = await cur.fetchone()
-    await cur.close()
+async def get_or_create_participant(user_id: int, username: str | None, first_name: str | None) -> int:
+    """
+    Вернёт существующий номер или создаст новый участник в Postgres.
+    """
+    assert db_pool is not None
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id FROM participants WHERE user_id = $1",
+            user_id,
+        )
+        if row:
+            return row["id"]
 
-    if row:
-        return row[0]
-
-    cur = await db.execute(
-        "INSERT INTO participants (user_id, username, first_name) VALUES (?, ?, ?)",
-        (user_id, username, first_name),
-    )
-    await db.commit()
-    return cur.lastrowid
+        row = await conn.fetchrow(
+            """
+            INSERT INTO participants (user_id, username, first_name)
+            VALUES ($1, $2, $3)
+            RETURNING id;
+            """,
+            user_id,
+            username,
+            first_name,
+        )
+        return row["id"]
 
 
 async def get_all_participants():
-    global db
-    cur = await db.execute(
-        "SELECT id, user_id, username, first_name FROM participants ORDER BY id"
-    )
-    rows = await cur.fetchall()
-    await cur.close()
-    return rows
+    """
+    Возвращает всех участников из Postgres.
+    """
+    assert db_pool is not None
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, user_id, username, first_name
+            FROM participants
+            ORDER BY id;
+            """
+        )
+        return rows
 
 
 # === Вспомогательные функции ===
@@ -157,7 +177,12 @@ async def cmd_list(message: Message):
         return
 
     lines = []
-    for pid, user_id, username, first_name in rows:
+    for row in rows:
+        pid = row["id"]
+        user_id = row["user_id"]
+        username = row["username"]
+        first_name = row["first_name"]
+
         nick = f"@{username}" if username else (first_name or str(user_id))
         lines.append(f"{pid}. {nick} (id {user_id})")
 
@@ -186,7 +211,7 @@ async def handle_webhook(request: web.Request) -> web.Response:
     try:
         # Парсим апдейт
         update = Update.model_validate(data)
-        # ВАЖНО: передаём и bot, и update
+        # ВАЖНО: передаём и bot, и update (aiogram 3)
         await dp.feed_update(bot, update)
     except Exception as e:
         logging.exception("Ошибка при обработке апдейта: %s", e)
@@ -209,14 +234,14 @@ def create_app() -> web.Application:
     app.router.add_get("/", healthcheck)
 
     async def on_startup(app: web.Application):
-        logging.info("Запуск приложения, инициализируем БД...")
+        logging.info("Запуск приложения, инициализируем БД (Postgres)...")
         await init_db()
 
     async def on_cleanup(app: web.Application):
-        logging.info("Останавливаемся, закрываем БД и сессию бота...")
-        global db
-        if db is not None:
-            await db.close()
+        logging.info("Останавливаемся, закрываем пул БД и сессию бота...")
+        global db_pool
+        if db_pool is not None:
+            await db_pool.close()
         await bot.session.close()
 
     app.on_startup.append(on_startup)
